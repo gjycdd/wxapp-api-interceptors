@@ -1,52 +1,83 @@
+if (!Promise.prototype.finally) {
+    Promise.prototype.finally = function (callback) {
+        return this.then(
+            value => this.constructor.resolve(callback()).then(() => value),
+            reason => this.constructor.resolve(callback()).then(() => { throw reason; }),
+        );
+    };
+}
 export default (interceptors = {}) => {
     const oldWx = {...wx};
-
     wx = new Proxy({}, {
         get(receiver, name) {
             if (name === 'request') {
                 return receiver.request;
             }
-            if (name.includes('Sync')) {
-                return oldWx[name];
+            if (name === 'old') {
+                return oldWx;
             }
-            return (params = {}) => new Promise(async (resolve, reject) => {
-                let resFn = (res, cb) => {
-                    cb(res);
-                };
-                if (interceptors[name]) {
-                    const {request = () => params, response = obj => obj} = interceptors[name];
-                    try {
-                        params = (await request(params)) || params;
-                    } catch (e) {
-                        throw console.error(e);
-                    }
-                    resFn = async (res, cb) => {
-                        res = (await response(res)) || res;
+            return (...arg) => {
+                let [params = {}] = arg;
+                const handleIntercept = async (isAsync = false) => {
+                    let resFn = (res, cb) => {
                         cb(res);
                     };
+                    if (interceptors[name]) {
+                        const {request = () => params, response = obj => obj} = interceptors[name];
+                        try {
+                            params = (isAsync ? request(params) : (await request(params))) || params;
+                        } catch (e) {
+                            throw console.error(e);
+                        }
+                        resFn = async (res, cb) => {
+                            res = (isAsync ? response(res) : (await response(res))) || res;
+                            cb(res);
+                        };
+                    }
+                    return resFn;
+                };
+                const isAsync = (
+                    (
+                        oldWx.canIUse(`${name}.success`)
+                        || (
+                            !oldWx.canIUse(`${name}.return`) && oldWx.canIUse(`${name}.object`)
+                        )
+                    )
+                    || interceptors[name]
+                );
+                if (interceptors[name] && !isAsync) {
+                    handleIntercept(true);
+                    arg[0] = params;
+                } else if (isAsync || interceptors[name]) {
+                    return new Promise(async (resolve, reject) => {
+                        const {success = () => '', fail = () => ''} = params;
+                        const resFn = await handleIntercept();
+                        oldWx[name](Object.assign(params, {
+                            success: res => resFn(res, (newRes) => {
+                                resolve(newRes);
+                                success(newRes);
+                            }),
+                            fail: res => resFn(res, (newRes) => {
+                                reject(newRes);
+                                fail(newRes);
+                            }),
+                        }));
+                    });
                 }
-                const {success = () => '', fail = () => ''} = params;
-                oldWx[name](Object.assign(params, {
-                    success: res => resFn(res, (newRes) => {
-                        resolve(newRes);
-                        success(newRes);
-                    }),
-                    fail: res => resFn(res, (newRes) => {
-                        reject(newRes);
-                        fail(newRes);
-                    }),
-                }));
-            });
+                return oldWx[name](...arg);
+            };
         },
     });
 
     wx.request = new Proxy(async (url, params = {}) => {
+        if (typeof url === 'object') {
+            params = url;
+            url = url.url;
+        } else {
+            params.url = url;
+        }
         if (interceptors.request) {
             const {request: {request = obj => obj}} = interceptors;
-            if (typeof url === 'object') {
-                params = url;
-                url = url.url;
-            }
             try {
                 params = (await request({...params, url})) || params;
             } catch (e) {
@@ -54,27 +85,34 @@ export default (interceptors = {}) => {
             }
         }
         return new Promise((resolve, reject) => {
-            const {success = resolve, fail = reject} = params;
+            const {success = () => '', fail = () => ''} = params;
             async function resFn(res, cb) {
                 const {statusCode} = res;
-                const firstCode = +statusCode.toString().split('')[0];
                 if (interceptors.request) {
                     const {request: {response = () => res}} = interceptors;
                     try {
                         res = (await response(res)) || res;
                     } catch (e) {
+                        reject(e);
                         fail(e);
                     }
                 }
-                if (firstCode !== 2) {
+                if (statusCode >= 400) {
+                    reject(res);
                     fail(res);
                     return;
                 }
                 cb(res);
             }
             oldWx.request(Object.assign(params, {
-                success: res => resFn(res, success),
-                fail: res => resFn(res, fail),
+                success: res => resFn(res, (newRes) => {
+                    success(newRes);
+                    resolve(newRes);
+                }),
+                fail: res => resFn(res, (newRes) => {
+                    fail(newRes);
+                    reject(newRes);
+                }),
             }));
         });
     }, {
